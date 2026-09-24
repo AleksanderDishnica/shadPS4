@@ -321,6 +321,19 @@ struct PM4CmdDrawIndexAuto {
     u32 draw_initiator;
 };
 
+struct PM4CmdSetPredication {
+    PM4Type3Header header;
+    u32 addr_lo; // DW1: low 32 bits of the predicate buffer address
+    u32 addr_hi; // DW2: [23:0] high address bits, [31:24] predication op/flags
+    u64 Address() const {
+        return (u64(addr_lo) | (u64(addr_hi) << 32)) & 0xFFFFFFFFFFFFull;
+    }
+    u32 Op() const {
+        return addr_hi >> 24;
+    }
+};
+static_assert(sizeof(PM4CmdSetPredication) == 12);
+
 enum class DataSelect : u32 {
     None = 0,
     Data32Low = 1,

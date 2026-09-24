@@ -8,6 +8,11 @@
 #include <vector>
 #include <CLI/CLI.hpp>
 #include <SDL3/SDL_messagebox.h>
+#ifdef _WIN32
+#include <crtdbg.h>
+#include <signal.h>
+#include <stdlib.h>
+#endif
 
 #include "common/arch.h"
 #include "common/key_manager.h"
@@ -29,9 +34,114 @@
 #include <sys/sysctl.h>
 #endif
 
+#ifdef _WIN32
+static void Shadps4InvalidParameterHandler(const wchar_t* expression, const wchar_t* function,
+                                            const wchar_t* file, unsigned int line,
+                                            uintptr_t reserved) {
+    LOG_ERROR(Common, "Invalid CRT parameter (game passed bad arguments); continuing");
+}
+
+// Diagnostics: file exit tracing is disabled unless SHADPS4_CRASH_REPORT is
+// set (its value is the output path; "1" = crash_report.txt next to the exe).
+static HANDLE OpenDiagFile() noexcept {
+    char env[512]{};
+    size_t len = 0;
+    if (getenv_s(&len, env, sizeof(env) - 1, "SHADPS4_CRASH_REPORT") != 0 || len == 0) {
+        return INVALID_HANDLE_VALUE;
+    }
+    std::wstring path;
+    if (strcmp(env, "1") == 0) {
+        path = L"crash_report.txt";
+    } else {
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, env, -1, nullptr, 0);
+        path.resize(wlen);
+        MultiByteToWideChar(CP_UTF8, 0, env, -1, path.data(), wlen);
+    }
+    return CreateFileW(path.c_str(), FILE_APPEND_DATA, 0, nullptr, OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+static void LogExitPath(const char* why) {
+    // Append to crash report file so it survives even if spdlog is dead.
+    HANDLE f = OpenDiagFile();
+    if (f != INVALID_HANDLE_VALUE) {
+        SetFilePointer(f, 0, nullptr, FILE_END);
+        DWORD written = 0;
+        WriteFile(f, why, (DWORD)strlen(why), &written, nullptr);
+        WriteFile(f, "\n", 1, &written, nullptr);
+        CloseHandle(f);
+    }
+}
+
+static void Shadps4TerminateHandler() {
+    char msg[256];
+    int n = _snprintf(msg, sizeof(msg), "EXIT_PATH: std::terminate: ");
+    try {
+        throw;
+    } catch (const std::exception& e) {
+        const char* w = e.what();
+        while (*w != '\0' && n < (int)sizeof(msg) - 2) {
+            msg[n++] = *w++;
+        }
+    } catch (...) {
+        n += _snprintf(msg + n, sizeof(msg) - n - 1, "(non-std exception)");
+    }
+    msg[n] = '\n';
+    msg[n + 1] = '\0';
+    LogExitPath(msg);
+    std::abort();
+}
+
+static void Shadps4PureVirtualCall() {
+    LogExitPath("EXIT_PATH: pure virtual call");
+    std::abort();
+}
+
+static void Shadps4Atexit() {
+    LogExitPath("EXIT_PATH: atexit (exit() or normal shutdown)");
+}
+
+static void Shadps4SigAbrt(int sig) {
+    // Capture the abort call stack for diagnosis.
+    {
+        void* frames[24];
+        const USHORT n = CaptureStackBackTrace(0, 24, frames, nullptr);
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        HANDLE h = OpenDiagFile();
+        if (h != INVALID_HANDLE_VALUE) {
+            SetFilePointer(h, 0, nullptr, FILE_END);
+            DWORD written = 0;
+            WriteFile(h, "EXIT_PATH: SIGABRT (abort called)\n", 34, &written, nullptr);
+            for (USHORT i = 0; i < n; ++i) {
+                char line[128];
+                HMODULE m = nullptr;
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   (LPCWSTR)frames[i], &m);
+                const int ln = _snprintf(line, sizeof(line), "  ABORTFRAME %p (%s+%llx)\n",
+                                         frames[i], m ? "module" : "no-module",
+                                         m ? (unsigned long long)((u8*)frames[i] - (u8*)m)
+                                           : 0ull);
+                WriteFile(h, line, ln, &written, nullptr);
+            }
+            CloseHandle(h);
+        }
+    }
+    _exit(3);
+}
+#endif
+
 int main(int argc, char* argv[]) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
+    // Prevent MSVC secure CRT functions from silently terminating the process
+    // when guest code passes invalid arguments (e.g. buffer too small).
+    _set_invalid_parameter_handler(&Shadps4InvalidParameterHandler);
+    _CrtSetReportMode(_CRT_ASSERT, 0);
+    std::set_terminate(&Shadps4TerminateHandler);
+    _set_purecall_handler(&Shadps4PureVirtualCall);
+    atexit(&Shadps4Atexit);
+    signal(SIGABRT, &Shadps4SigAbrt);
 #endif
 
 #if defined(__APPLE__) && defined(ARCH_X86_64)

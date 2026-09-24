@@ -122,9 +122,44 @@ void Liverpool::Process(std::stop_token stoken) {
                 }
                 task = queue.submits.front();
             }
-            task.resume();
+            bool batch_failed = false;
+            try {
+                task.resume();
+            } catch (const std::exception& e) {
+                // A host crash converted to an exception (crash-to-throw) or a
+                // stray exception escaped the coroutine. Drop this batch.
+                LOG_WARNING(Render, "GPU submit batch failed on queue {}: {}", curr_qid,
+                            e.what());
+                batch_failed = true;
+            } catch (...) {
+                LOG_WARNING(Render, "GPU submit batch failed on queue {}", curr_qid);
+                batch_failed = true;
+            }
+
+            if (batch_failed) {
+                task.destroy();
+                std::scoped_lock lock{queue.m_access};
+                queue.submits.pop();
+                --num_submits;
+                std::scoped_lock lock2{submit_mutex};
+                submit_cv.notify_all();
+                continue;
+            }
 
             if (task.done()) {
+                if (task.promise().exception) {
+                    // The batch threw (e.g. bad_alloc from corrupted state).
+                    // Drop it instead of killing the emulator.
+                    try {
+                        std::rethrow_exception(task.promise().exception);
+                    } catch (const std::exception& e) {
+                        LOG_WARNING(Render, "Dropping failed GPU submit batch on queue {}: {}",
+                                    curr_qid, e.what());
+                    } catch (...) {
+                        LOG_WARNING(Render, "Dropping failed GPU submit batch on queue {}",
+                                    curr_qid);
+                    }
+                }
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -407,7 +442,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                const auto* set_pred = reinterpret_cast<const PM4CmdSetPredication*>(header);
+                predication_op = set_pred->Op();
+                predication_addr = set_pred->Address();
+                predication_enabled = predication_addr != 0;
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -974,7 +1012,30 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (dst_addr >= base_addr && dst_addr < base_addr + acb_size &&
                     num_bytes == sizeof(PM4CmdDispatchIndirect::GroupDimensions) &&
                     header->type == 3 && header->type3.opcode == PM4ItOpcode::DispatchDirect) {
-                    indirect_patches.emplace_back(header, src_addr);
+                    // Replace any stale entry for this header so repeated
+                    // patches do not grow the vector unboundedly (Dreams
+                    // patches dispatch dimensions many times per header).
+                    indirect_patches.erase(
+                        std::remove_if(indirect_patches.begin(), indirect_patches.end(),
+                                       [header](const IndirectPatch& p) {
+                                           return p.header == header;
+                                       }),
+                        indirect_patches.end());
+                    if (indirect_patches.empty()) {
+                        LOG_WARNING(Render,
+                                    "ASC indirect patch tracking started: header={:#x} "
+                                    "vqid={} submit_base={:#x}",
+                                    (VAddr)header, vqid, base_addr);
+                    }
+                    if (indirect_patches.size() < 65536) {
+                        indirect_patches.emplace_back(header, src_addr);
+                    } else if (indirect_patches.size() == 65536) {
+                        LOG_WARNING(Render,
+                                    "ASC indirect patch cap reached (dispatches not consuming "
+                                    "them?); further patches dropped. header={:#x}",
+                                    (VAddr)header);
+                        indirect_patches.emplace_back(header, src_addr);
+                    }
                 } else {
                     rasterizer->CopyBuffer(dst_addr, src_addr, num_bytes, false, false);
                 }
@@ -1024,7 +1085,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
-                rasterizer->DispatchIndirect(it->indirect_addr, 0, size);
+                const VAddr indirect_addr = it->indirect_addr;
+                indirect_patches.erase(it); // consume the patch
+                rasterizer->DispatchIndirect(indirect_addr, 0, size);
                 break;
             }
             auto& cs_program = GetCsRegs();

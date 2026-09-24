@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include <atomic>
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -198,10 +199,34 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
+    // One-shot draw diagnostics for black-screen debugging
+    static std::atomic<u64> draw_count{0};
+    const u64 n = draw_count.fetch_add(1);
+    if (n < 20 || (n % 10000) == 0) {
+        const auto rt0 = liverpool->regs.color_buffers[0].base_address;
+        LOG_DEBUG(Render, "Draw #{}: indexed={} indices={} rt0={:#x}", n, is_indexed,
+                    liverpool->regs.num_indices, rt0);
+    }
+
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
     if (!pipeline) {
         return;
+    }
+
+    // GPU predication. Log the predicate value at record time; skip only when zero.
+    if (liverpool->predication_enabled) {
+        u64 predicate = 1;
+        const bool readable = memory->ReadU64(liverpool->predication_addr, predicate);
+        static std::atomic<u64> pred_log_count{0};
+        if (pred_log_count.fetch_add(1) < 32) {
+            LOG_WARNING(Render, "Predication: addr {:#x} readable={} value={:#x} op={}",
+                        liverpool->predication_addr, readable, predicate,
+                        liverpool->predication_op);
+        }
+        if (predicate == 0) {
+            return;
+        }
     }
 
     PrepareRenderState(pipeline);
@@ -256,6 +281,15 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
         return;
+    }
+
+    // GPU predication (CPU-side evaluation, see Rasterizer::Draw).
+    if (liverpool->predication_enabled) {
+        u64 predicate = 1;
+        memory->ReadU64(liverpool->predication_addr, predicate);
+        if (predicate == 0) {
+            return;
+        }
     }
 
     PrepareRenderState(pipeline);
@@ -771,6 +805,14 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                 // Redirect the access to the actual depth-stencil buffer.
                 image_id = depth_image_id;
                 image = &texture_cache.GetImage(image_id);
+            }
+            // Menu-render diagnostics: log large texture bindings so the guest
+            // backing memory can be dumped and inspected externally.
+            if (image->info.guest_size > 512_KB) {
+                LOG_DEBUG(Render_Vulkan, "TEXBIND addr={:#x} size={:#x} {}x{} fmt={} written={}",
+                            image->info.guest_address, image->info.guest_size, image->info.size.width,
+                            image->info.size.height, static_cast<u32>(image->info.pixel_format),
+                            image_desc.is_written);
             }
             if (image->binding.is_bound) {
                 // The image is already bound. In case if it is about to be used as storage we

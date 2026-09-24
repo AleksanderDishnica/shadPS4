@@ -63,6 +63,11 @@ struct Liverpool {
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 
+    // GPU predication state set by IT_SET_PREDICATION, consumed by the rasterizer.
+    u64 predication_addr{};
+    u32 predication_op{};
+    bool predication_enabled{};
+
 public:
     explicit Liverpool();
     ~Liverpool();
@@ -159,17 +164,18 @@ private:
                 return {};
             }
             void unhandled_exception() {
-                try {
-                    std::rethrow_exception(std::current_exception());
-                } catch (const std::exception& e) {
-                    UNREACHABLE_MSG("Unhandled exception: {}", e.what());
-                }
+                // Store the exception instead of rethrowing out of resume();
+                // the GPU processor loop drops the failed batch. Rethrowing
+                // would terminate the emulator (Dreams hits allocation
+                // failures from corrupted GPU-side state).
+                exception = std::current_exception();
             }
             void return_void() {}
             struct empty {};
             std::suspend_always yield_value(empty&&) {
                 return {};
             }
+            std::exception_ptr exception{};
         };
 
         using Handle = std::coroutine_handle<promise_type>;

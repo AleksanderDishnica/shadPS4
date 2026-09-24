@@ -1080,7 +1080,9 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/ir/value.h
 )
 
-set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
+set(VIDEO_CORE src/video_core/seh_guard.cpp
+src/video_core/seh_guard.h
+src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/liverpool.cpp
                src/video_core/amdgpu/liverpool.h
                src/video_core/amdgpu/pixel_format.cpp

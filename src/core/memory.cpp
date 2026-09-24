@@ -11,11 +11,20 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#include "core/signals.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
 
+namespace {
+bool LazyDecommitFaultHandler(void* context, void* fault_address) {
+    return Common::Singleton<Core::MemoryManager>::Instance()->ReviveLazyDecommitted(
+        reinterpret_cast<VAddr>(fault_address));
+}
+} // namespace
+
 MemoryManager::MemoryManager() {
+    Signals::Instance()->RegisterAccessViolationHandler(&LazyDecommitFaultHandler, 100);
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
 
     // Construct vma_map using the regions reserved by the address space
@@ -1645,6 +1654,41 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
     new_area.size -= offset_in_area;
 
     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
+}
+
+bool MemoryManager::ReadU64(VAddr addr, u64& out) const {
+    Common::SharedFirstMutex& m = const_cast<Common::SharedFirstMutex&>(mutex);
+    std::shared_lock lk{m};
+    const auto it = --vma_map.upper_bound(addr);
+    const auto& vma = it->second;
+    const u64 offset = addr - vma.base;
+    if (vma.type != VMAType::Direct && vma.type != VMAType::Flexible &&
+        vma.type != VMAType::Pooled) {
+        return false;
+    }
+    if (vma.phys_areas.empty()) {
+        return false;
+    }
+    auto phys = std::prev(vma.phys_areas.upper_bound(offset));
+    if (phys == vma.phys_areas.end() || offset >= phys->first + phys->second.size) {
+        return false;
+    }
+    const u64 offset_in_area = offset - phys->first;
+    if (offset_in_area + sizeof(u64) > phys->second.size) {
+        return false;
+    }
+    const u8* host = impl.BackingBase() + phys->second.base + offset_in_area;
+    std::memcpy(&out, host, sizeof(u64));
+    return true;
+}
+
+bool MemoryManager::ReviveLazyDecommitted(VAddr fault_address) {
+    if (impl.EnsureMappedRW(fault_address)) {
+        LOG_WARNING(Kernel_Vmm, "Allocated compat page at {:#x} for stray guest access",
+                    fault_address);
+        return true;
+    }
+    return false;
 }
 
 } // namespace Core

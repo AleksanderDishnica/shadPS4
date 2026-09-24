@@ -129,6 +129,11 @@ public:
         return custom_border_color;
     }
 
+    /// Returns true when VK_EXT_conditional_rendering is supported
+    bool IsConditionalRenderingSupported() const {
+        return conditional_rendering;
+    }
+
     /// Returns true when VK_EXT_shader_stencil_export is supported
     bool IsShaderStencilExportSupported() const {
         return shader_stencil_export;
@@ -507,6 +512,7 @@ private:
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};
     bool list_restart{};
+    bool conditional_rendering{};
     bool provoking_vertex{};
     bool shader_stencil_export{};
     bool image_load_store_lod{};

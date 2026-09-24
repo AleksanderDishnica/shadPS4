@@ -29,9 +29,18 @@ NativeThread::~NativeThread() {}
 int NativeThread::Create(ThreadFunc func, void* arg) {
 #ifndef _WIN64
     pthread_t* pthr = reinterpret_cast<pthread_t*>(&native_handle);
-    return pthread_create(pthr, nullptr, func, arg);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    // PS4 thread stacks are fully committed at creation time; some games
+    // (e.g. Dreams' internal JIT) access stack memory far above the current
+    // stack pointer, which would fault on lazily committed host stacks.
+    pthread_attr_setstacksize(&attr, 8_MB);
+    return pthread_create(pthr, &attr, func, arg);
 #else
-    native_handle = CreateThread(nullptr, 0, func, arg, 0, nullptr);
+    // CreateThread commits only dwStackSize bytes eagerly. Use a large
+    // eagerly-committed stack so guest code reading above the stack pointer
+    // (PS4 stacks are fully committed from creation) does not fault.
+    native_handle = CreateThread(nullptr, 8_MB, func, arg, 0, nullptr);
     if (native_handle == nullptr) {
         return GetLastError();
     }
@@ -72,6 +81,22 @@ void NativeThread::Initialize() {
 #endif
 #if _WIN64
     tid = GetCurrentThreadId();
+    // PS4 thread stacks are fully committed from creation. Some guest code
+    // (e.g. Dreams' internal JIT) reads stack memory far above the current
+    // stack pointer, which hard-faults on Windows' lazily grown stacks.
+    // Commit the entire stack reservation up front.
+    {
+        NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+        MEMORY_BASIC_INFORMATION alloc{};
+        if (VirtualQuery(tib->StackLimit, &alloc, sizeof(alloc)) != 0 &&
+            alloc.AllocationBase != nullptr) {
+            const u64 total = reinterpret_cast<u64>(tib->StackBase) -
+                              reinterpret_cast<u64>(alloc.AllocationBase);
+            if (total > 0 && total < 1_GB) {
+                VirtualAlloc(alloc.AllocationBase, total, MEM_COMMIT, PAGE_READWRITE);
+            }
+        }
+    }
 #else
     tid = (u64)pthread_self();
 

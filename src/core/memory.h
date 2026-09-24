@@ -5,6 +5,7 @@
 
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
 #include "common/enum.h"
@@ -340,6 +341,22 @@ private:
     u64 total_flexible_size{};
     u64 flexible_usage{};
     u64 pool_budget{};
+
+    // Lazy decommit support. Game engines with fiber job systems (e.g. Bluepoint's) can
+    // decommit a memory pool while a straggler worker thread still writes to it. On real
+    // hardware the timing never overlaps; under emulation it does, and unmapping host
+    // pages kills the process with an unwalkable stack. Instead of unmapping, pages are
+    // kept mapped but inaccessible, and revived on fault by the registered access
+    // violation handler below.
+    std::shared_mutex lazy_decommit_mutex;
+    std::map<VAddr, u64> lazy_decommitted_ranges;
+
+public:
+    bool ReviveLazyDecommitted(VAddr fault_address);
+
+    /// Reads a u64 from guest memory through the unified host backing, when the address
+    /// has direct physical mapping. Returns false if it cannot be translated.
+    bool ReadU64(VAddr addr, u64& out) const;
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
 

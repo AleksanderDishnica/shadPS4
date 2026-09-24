@@ -81,6 +81,9 @@ public:
     /// Unmaps specified virtual memory area.
     void Unmap(VAddr virtual_addr, u64 size);
 
+    /// Compat: maps fresh anonymous RW pages at the faulting address if unmapped.
+    bool EnsureMappedRW(VAddr fault_addr);
+
     /// Protects requested region.
     void Protect(VAddr virtual_addr, u64 size, MemoryPermission perms);
 

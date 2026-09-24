@@ -391,12 +391,35 @@ struct SignalImpl : public PageManager::Impl {
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
         const auto addr = reinterpret_cast<VAddr>(fault_address);
-        if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, 8);
-        } else {
-            return rasterizer->ReadMemory(addr, 8);
+#if defined(_WIN32)
+        // Only claim faults on pages we can actually service. Missing or
+        // inaccessible pages must reach the guest's own fault handler; claiming
+        // them here without fixing the underlying issue causes an endless
+        // fault loop.
+        {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(fault_address, &mbi, sizeof(mbi)) == 0 ||
+                mbi.State != MEM_COMMIT || mbi.Protect == PAGE_NOACCESS) {
+                return false;
+            }
         }
-        return false;
+#endif
+        if (Common::IsWriteError(context)) {
+            if (rasterizer->InvalidateMemory(addr, 8)) {
+                // Tracked page: the write protection was installed by us to
+                // catch CPU writes. Invalidate the caches, then lift the
+                // write protection so the faulting write can proceed. Use a
+                // raw VirtualProtect — the memory manager locks are unsafe to
+                // acquire from the fault handler. Widen to 64KB to reduce
+                // repeat faults from adjacent writes.
+                DWORD old_protect = 0;
+                VirtualProtect(reinterpret_cast<void*>(addr & ~VAddr(64_KB - 1)), 64_KB,
+                               PAGE_READWRITE, &old_protect);
+                return true;
+            }
+            return false;
+        }
+        return rasterizer->ReadMemory(addr, 8);
     }
 };
 

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -48,6 +50,13 @@ constexpr VAddr USER_MAX = 0x54FFFFFFFFFFULL;
 #elif defined(__FreeBSD__)
 // FreeBSD address space is extremely volatile, keep this lower for safety.
 constexpr VAddr USER_MAX = 0xFFFFFFFFFFFULL;
+#elif defined(_WIN32)
+// Windows supports the full 47-bit user VA space. Some games (e.g. Dreams)
+// hardcode JIT/stack arenas at high addresses such as 0x700000000000-0x70C5...,
+// which are valid on real PS4 hardware. Stay below the architectural edge
+// where VirtualQuery becomes unreliable. (Actual guest-usable reservations are
+// further filtered by the high-memory windows above.)
+constexpr VAddr USER_MAX = 0x7FFF00000000ULL;
 #else
 constexpr VAddr USER_MAX = 0x5FFFFFFFFFFFULL;
 #endif
@@ -128,22 +137,59 @@ struct AddressSpace::Impl {
         // This is the build number for Windows 11 22H2
         static constexpr s32 AffectedBuildNumber = 22621;
 
-        // Higher PS4 firmware versions prevent higher address mappings too.
-        s32 sdk_ver = Common::ElfInfo::Instance().CompiledSdkVer();
-        if (os_version_info.dwBuildNumber <= AffectedBuildNumber ||
-            sdk_ver >= Common::ElfInfo::FW_300) {
+        // Older Windows versions have issues with very high address space
+        // reservations; restrict to 1TB there. Games with newer SDKs may still
+        // need high mappings (e.g. Dreams' JIT arena), so only the OS build
+        // gates the reduction.
+        if (os_version_info.dwBuildNumber <= AffectedBuildNumber) {
             supported_user_max = 0x10000000000ULL;
-            // Only log the message if we're restricting the user max due to operating system.
-            // Since higher compiled SDK versions also get reduced max, we don't need to log there.
-            if (sdk_ver < Common::ElfInfo::FW_300) {
-                LOG_WARNING(
-                    Core,
-                    "Older Windows version detected, reducing user max to {:#x} to avoid problems",
-                    supported_user_max);
-            }
+            LOG_WARNING(Core,
+                        "Older Windows version detected, reducing user max to {:#x} to avoid "
+                        "problems",
+                        supported_user_max);
         }
 
+        // Increase BackingSize to account for config options.
+        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
+                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
+
+        // Allocate backing file that represents the total physical memory.
+        // This must happen BEFORE reserving all free address space, otherwise
+        // no contiguous range remains for the backing mapping.
+        backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
+                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
+                                            nullptr, nullptr, 0);
+
+        ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
+        // Allocate a virtual memory for the backing file map as placeholder
+        backing_base = static_cast<u8*>(VirtualAlloc2(process, nullptr, BackingSize,
+                                                      MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
+                                                      PAGE_NOACCESS, nullptr, 0));
+        ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
+
+        // Map backing placeholder. This will commit the pages
+        void* const ret =
+            MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
+                           MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
+        ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
+
         // Determine the free address ranges we can access.
+        // High-memory windows required by some games (e.g. Dreams uses
+        // hardcoded arenas around 0x102xxxxxxxx and 0x700-0x70C TB for its
+        // internal JIT and fiber stacks). Everything outside these windows is
+        // left free so that the host GPU driver can allocate address space.
+        struct AddrWindow {
+            VAddr lo, hi;
+        };
+        static constexpr std::array<AddrWindow, 2> HighMemWindows{{
+            {0x1000000000ULL, 0x20000000000ULL},     // 64GB - 2TB
+            {0x700000000000ULL, 0x710000000000ULL},  // Dreams JIT arenas
+        }};
+        const auto in_high_window = [](VAddr lo, VAddr hi) {
+            return std::ranges::any_of(HighMemWindows, [&](const AddrWindow& w) {
+                return lo < w.hi && hi > w.lo;
+            });
+        };
         VAddr next_addr = SYSTEM_MANAGED_MIN;
         MEMORY_BASIC_INFORMATION info{};
         while (next_addr <= supported_user_max) {
@@ -165,6 +211,11 @@ struct AddressSpace::Impl {
             // Restrict region size to avoid overly fragmenting the virtual memory space.
             if (info.State == MEM_FREE && info.RegionSize > 0x1000000) {
                 VAddr addr = Common::AlignUp(reinterpret_cast<VAddr>(info.BaseAddress), alignment);
+                // Skip free regions in the middle of the address space — only
+                // the system ranges and the high-memory windows are needed.
+                if (addr >= USER_MIN && !in_high_window(addr, addr + size)) {
+                    continue;
+                }
                 regions.emplace(addr,
                                 MemoryRegion{addr, PAddr(-1), size, PAGE_NOACCESS, -1, false});
             }
@@ -188,28 +239,6 @@ struct AddressSpace::Impl {
         system_reserved_size = SystemReservedSize;
         user_base = reinterpret_cast<u8*>(USER_MIN);
         user_size = supported_user_max - USER_MIN - 1;
-
-        // Increase BackingSize to account for config options.
-        BackingSize += EmulatorSettings.GetExtraDmemInMBytes() * 1_MB +
-                       EmulatorSettings.GetExtraFmemInMBytes() * 1_MB;
-
-        // Allocate backing file that represents the total physical memory.
-        backing_handle = CreateFileMapping2(INVALID_HANDLE_VALUE, nullptr, FILE_MAP_ALL_ACCESS,
-                                            PAGE_EXECUTE_READWRITE, SEC_COMMIT, BackingSize,
-                                            nullptr, nullptr, 0);
-
-        ASSERT_MSG(backing_handle, "{}", Common::GetLastErrorMsg());
-        // Allocate a virtual memory for the backing file map as placeholder
-        backing_base = static_cast<u8*>(VirtualAlloc2(process, nullptr, BackingSize,
-                                                      MEM_RESERVE | MEM_RESERVE_PLACEHOLDER,
-                                                      PAGE_NOACCESS, nullptr, 0));
-        ASSERT_MSG(backing_base, "{}", Common::GetLastErrorMsg());
-
-        // Map backing placeholder. This will commit the pages
-        void* const ret =
-            MapViewOfFile3(backing_handle, process, backing_base, 0, BackingSize,
-                           MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0);
-        ASSERT_MSG(ret == backing_base, "{}", Common::GetLastErrorMsg());
     }
 
     ~Impl() {
@@ -409,7 +438,11 @@ struct AddressSpace::Impl {
 
         // Get the address and region for this range.
         auto& [base, region] = *it;
-        ASSERT_MSG(!region.is_mapped, "Cannot overwrite mapped region");
+        if (region.is_mapped) {
+            // Lazily-kept stale view from a compat decommit: drop it so the new
+            // mapping can replace it cleanly instead of asserting.
+            UnmapRegion(&region);
+        }
 
         // Now we have a region matching the requested region, perform the actual mapping.
         region.is_mapped = true;
@@ -504,6 +537,55 @@ struct AddressSpace::Impl {
 
         // Coalesce any free space produced from these unmaps.
         CoalesceFreeRegions(virtual_addr);
+    }
+
+    // Compat: maps fresh anonymous RW pages at the faulting address if unmapped.
+    bool EnsureMappedRW(VAddr fault_addr) {
+        std::scoped_lock lk{mutex};
+        auto it = regions.upper_bound(fault_addr);
+        if (it == regions.begin()) {
+            return false;
+        }
+        --it;
+        auto& [base, region] = *it;
+        const u64 offset = fault_addr - base;
+        if (offset >= region.size) {
+            return false;
+        }
+        if (region.is_mapped) {
+            DWORD old_flags{};
+            if (!VirtualProtectEx(process, LPVOID(base), region.size, PAGE_READWRITE,
+                                  &old_flags)) {
+                return false;
+            }
+            region.prot = PAGE_READWRITE;
+            return true;
+        }
+        constexpr u64 alloc_granularity = 16_KB;
+        const VAddr region_end = base + region.size;
+        const VAddr alloc_base = Common::AlignDown(fault_addr, alloc_granularity);
+        const VAddr sub_base = std::max(alloc_base, base);
+        const VAddr sub_end = std::min(alloc_base + alloc_granularity, region_end);
+        if (sub_end <= sub_base) {
+            return false;
+        }
+        SplitRegion(sub_base, sub_end - sub_base);
+        auto new_it = regions.find(sub_base);
+        if (new_it == regions.end()) {
+            return false;
+        }
+        auto& [nbase, nregion] = *new_it;
+        void* ptr = VirtualAlloc2(process, reinterpret_cast<PVOID>(nbase), nregion.size,
+                                  MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER,
+                                  PAGE_READWRITE, nullptr, 0);
+        if (ptr == nullptr) {
+            return false;
+        }
+        nregion.is_mapped = true;
+        nregion.phys_base = -1;
+        nregion.fd = -1;
+        nregion.prot = PAGE_READWRITE;
+        return true;
     }
 
     void Protect(VAddr virtual_addr, u64 size, bool read, bool write, bool execute) {
@@ -841,6 +923,14 @@ void* AddressSpace::MapFile(VAddr virtual_addr, u64 size, u64 offset, u32 prot, 
 
 void AddressSpace::Unmap(VAddr virtual_addr, u64 size) {
     impl->Unmap(virtual_addr, size);
+}
+
+bool AddressSpace::EnsureMappedRW(VAddr fault_addr) {
+#ifdef _WIN32
+    return impl->EnsureMappedRW(fault_addr);
+#else
+    return false;
+#endif
 }
 
 void AddressSpace::Protect(VAddr virtual_addr, u64 size, MemoryPermission perms) {
