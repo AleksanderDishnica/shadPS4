@@ -9,6 +9,7 @@
 #include "shader_recompiler/ir/microinstruction.h"
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
+#include <stdexcept>
 
 #include <magic_enum/magic_enum.hpp>
 
@@ -527,51 +528,51 @@ void EmitStoreBufferFormatF32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id a
 }
 
 void EmitGetThreadBitScalarReg(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetThreadBitScalarReg (compat no-op)");
 }
 
 void EmitSetThreadBitScalarReg(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetThreadBitScalarReg (compat no-op)");
 }
 
 void EmitGetScalarRegister(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetScalarRegister (compat no-op)");
 }
 
 void EmitSetScalarRegister(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetScalarRegister (compat no-op)");
 }
 
 void EmitGetVectorRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetVectorRegister (compat no-op)");
 }
 
 void EmitSetVectorRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetVectorRegister (compat no-op)");
 }
 
 void EmitSetVirtualRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetVirtualRegister (compat no-op)");
 }
 
 void EmitGetVirtualRegister(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetVirtualRegister (compat no-op)");
 }
 
 void EmitSetGotoVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetGotoVariable (compat no-op)");
 }
 
 void EmitGetGotoVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetGotoVariable (compat no-op)");
 }
 
 void EmitSetMaskLaneVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled SetMaskLaneVariable (compat no-op)");
 }
 
 void EmitGetMaskLaneVariable(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+    throw std::runtime_error("Unhandled GetMaskLaneVariable (compat no-op)");
 }
 
 Id EmitGetPcLo(EmitContext& ctx, Id pc) {

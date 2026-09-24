@@ -16,9 +16,15 @@ void ComputeDominators(const IR::BlockList& post_order) {
         while (block1 != block2) {
             while (block1->po_index < block2->po_index) {
                 block1 = block1->immediate_dominator;
+                if (block1 == nullptr) {
+                    return nullptr;
+                }
             }
             while (block2->po_index < block1->po_index) {
                 block2 = block2->immediate_dominator;
+                if (block2 == nullptr) {
+                    return nullptr;
+                }
             }
         }
         return block1;
@@ -35,9 +41,12 @@ void ComputeDominators(const IR::BlockList& post_order) {
                 if (pred->immediate_dominator) {
                     new_idom = new_idom ? intersect(new_idom, pred) : pred;
                 }
+                if (new_idom == nullptr) {
+                    break;
+                }
             }
 
-            if (block->immediate_dominator != new_idom) {
+            if (new_idom != nullptr && block->immediate_dominator != new_idom) {
                 block->immediate_dominator = new_idom;
                 modified = true;
             }
@@ -46,13 +55,18 @@ void ComputeDominators(const IR::BlockList& post_order) {
 }
 
 void ComputeDominanceFrontiers(const IR::BlockList& post_order) {
+    // Bound idom-chain walks: malformed CFGs (compat fallthrough edges) can
+    // produce cycles or null chains that would otherwise loop forever.
+    const size_t max_walk = post_order.size() + 1;
     for (IR::Block* block : post_order) {
         if (block->ImmPredecessors().size() < 2) {
             continue;
         }
         for (IR::Block* const pred : block->ImmPredecessors()) {
             IR::Block* current = pred;
-            while (current != block->immediate_dominator) {
+            size_t walked = 0;
+            while (current != nullptr && current != block->immediate_dominator &&
+                   walked++ < max_walk) {
                 current->dominance_frontiers.push_back(block);
                 current = current->immediate_dominator;
             }

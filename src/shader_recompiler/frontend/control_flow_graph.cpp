@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <magic_enum/magic_enum.hpp>
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
@@ -100,16 +101,223 @@ static std::optional<u32> ResolveSetPcTarget(std::span<const GcnInst> list, u32 
     return result_pc & ~0x3u;
 }
 
+std::optional<u32> CFG::ResolveSetPcJumpTable(u32 setpc_index) {
+    // Compat: resolve an unresolvable S_SETPC_B64 through a PC-relative jump
+    // table: S_GETPC_B64; S_ADD_U32 imm (table pointer) ... S_LOAD_DWORDX2
+    // ... S_GETPC_B64; S_ADD(reg)...; S_SETPC_B64. Targets in the table are
+    // relative to the last GETPC. Returns the first plausible target.
+    const u32 scan_start = setpc_index >= 12 ? setpc_index - 12 : 0;
+    u32 table_addr = 0;
+    bool have_table = false;
+    u32 jump_base = 0;
+    bool have_jump_base = false;
+    for (u32 d = scan_start; d < setpc_index; ++d) {
+        const auto& g = inst_list[d];
+        if (g.opcode != Opcode::S_GETPC_B64) {
+            continue;
+        }
+        const u32 gpc = index_to_pc[d] + g.length;
+        // GETPC followed by ADD with a literal is the table pointer; any other
+        // GETPC in the window is the jump base.
+        if (d + 1 < setpc_index && inst_list[d + 1].opcode == Opcode::S_ADD_U32) {
+            u32 imm = 0;
+            bool has_imm = false;
+            for (u32 s = 0; s < inst_list[d + 1].src_count && s < 2; ++s) {
+                if (inst_list[d + 1].src[s].field == OperandField::LiteralConst) {
+                    imm = inst_list[d + 1].src[s].code;
+                    has_imm = true;
+                    break;
+                }
+            }
+            if (has_imm) {
+                table_addr = gpc + imm;
+                have_table = true;
+                continue;
+            }
+        }
+        jump_base = gpc;
+        have_jump_base = true;
+    }
+    if (!have_table || !have_jump_base || table_addr % sizeof(u32) != 0) {
+        return std::nullopt;
+    }
+    for (u32 e = 0; e < 16; ++e) {
+        const u32* lo = DwordAt(table_addr + e * 8);
+        const u32* hi = DwordAt(table_addr + e * 8 + 4);
+        if (lo == nullptr || hi == nullptr) {
+            break;
+        }
+        const u64 entry = (u64)*lo | ((u64)*hi << 32);
+        const u32 cand = (u32)((s64)jump_base + (s64)entry);
+        if (cand == 0 || cand % 4 != 0) {
+            continue;
+        }
+        if (cand + 0x10 > code.size() * sizeof(u32)) {
+            continue; // outside the shader
+        }
+        return cand;
+    }
+    return std::nullopt;
+}
+
+std::optional<CFG::SwitchInfo> CFG::ResolveSetPcJumpTableFull(u32 setpc_index) {
+    const u32 scan_start = setpc_index >= 16 ? setpc_index - 16 : 0;
+    u32 table_addr = 0;
+    bool have_table = false;
+    u32 jump_base = 0;
+    bool have_jump_base = false;
+    u32 sel_sgpr = 0xFFFFFFFF;
+    u32 scale = 1;
+    for (u32 d = scan_start; d < setpc_index; ++d) {
+        const auto& g = inst_list[d];
+        if (g.opcode == Opcode::S_LSHL_B32 && g.dst_count > 0 &&
+            g.dst[0].field == OperandField::ScalarGPR) {
+            // Candidate selector computation: index << scale
+            sel_sgpr = g.dst[0].code;
+            if (g.src_count > 1) {
+                scale = 1u << (g.src[1].code & 0x1F);
+            }
+            continue;
+        }
+        if (g.opcode != Opcode::S_GETPC_B64) {
+            continue;
+        }
+        const u32 gpc = index_to_pc[d] + g.length;
+        // GETPC followed by ADD with a literal is the table pointer; any other
+        // GETPC in the window is the jump base.
+        if (d + 1 < setpc_index && inst_list[d + 1].opcode == Opcode::S_ADD_U32) {
+            u32 imm = 0;
+            bool has_imm = false;
+            for (u32 s = 0; s < inst_list[d + 1].src_count && s < 2; ++s) {
+                if (inst_list[d + 1].src[s].field == OperandField::LiteralConst) {
+                    imm = inst_list[d + 1].src[s].code;
+                    has_imm = true;
+                    break;
+                }
+            }
+            if (has_imm) {
+                table_addr = gpc + imm;
+                have_table = true;
+                continue;
+            }
+        }
+        jump_base = gpc;
+        have_jump_base = true;
+    }
+    if (!have_table || !have_jump_base || table_addr % sizeof(u32) != 0) {
+        return std::nullopt;
+    }
+    SwitchInfo info;
+    info.sel_sgpr = sel_sgpr;
+    info.scale = scale;
+    for (u32 e = 0; e < 32; ++e) {
+        const u32* lo = DwordAt(table_addr + e * 8);
+        const u32* hi = DwordAt(table_addr + e * 8 + 4);
+        if (lo == nullptr || hi == nullptr) {
+            break;
+        }
+        const u64 entry = (u64)*lo | ((u64)*hi << 32);
+        const u32 cand = (u32)((s64)jump_base + (s64)entry);
+        if (cand == 0 || cand % 4 != 0 || cand + 0x10 > code.size() * sizeof(u32)) {
+            break; // end of plausible table
+        }
+        if (std::ranges::find(info.targets, cand) == info.targets.end()) {
+            info.targets.push_back(cand);
+        }
+    }
+    if (info.targets.size() < 2) {
+        return std::nullopt;
+    }
+    return info;
+}
+
+void CFG::LowerSwitches() {
+    // Collect switch blocks first; inserting dummies while iterating the
+    // intrusive set would invalidate iteration.
+    boost::container::small_vector<Block*, 4> switch_blocks;
+    for (auto& block : blocks) {
+        if (block.end_inst.opcode == Opcode::S_SETPC_B64) {
+            switch_blocks.push_back(&block);
+        }
+    }
+    u32 synth_pc = 0x40000000u;
+    for (Block* blk : switch_blocks) {
+        auto sw = ResolveSetPcJumpTableFull(blk->end_index);
+        if (!sw) {
+            continue;
+        }
+        // All targets must exist as blocks (EmitLabels added labels for them).
+        bool all_present = true;
+        for (u32 t : sw->targets) {
+            auto it = blocks.find(t, Compare{});
+            if (it == blocks.end() || it->begin != t) {
+                all_present = false;
+                break;
+            }
+        }
+        if (!all_present || !blk->branch_true) {
+            continue;
+        }
+        if (blk->branch_true->begin != sw->targets[0]) {
+            continue; // linking mismatch; keep the existing single target
+        }
+        blk->is_switch = true;
+        blk->switch_sel_sgpr = sw->sel_sgpr;
+        blk->switch_selector_scale = sw->scale;
+
+        // Build the dummy chain dispatching targets[1..N-1]. The switch block
+        // keeps branch_true = targets[0] and gains branch_false = dummy0. Each
+        // dummy dispatches one case; the final dummy jumps unconditionally.
+        Block* cur = blk;
+        for (size_t i = 1; i < sw->targets.size(); ++i) {
+            auto it = blocks.find(sw->targets[i], Compare{});
+            Block* target = &*it;
+            Block* dummy = block_pool.Create();
+            dummy->begin = synth_pc;
+            dummy->end = synth_pc;
+            synth_pc += 4;
+            dummy->begin_index = 1;
+            dummy->end_index = 0; // empty instruction span
+            dummy->end_class = EndClass::Branch;
+            dummy->cond = IR::Condition::Scc0;
+            dummy->end_inst = blk->end_inst;
+            dummy->is_dummy = true;
+            dummy->is_switch_dummy = true;
+            dummy->switch_sel_sgpr = sw->sel_sgpr;
+            dummy->switch_selector_scale = sw->scale;
+            dummy->num_predecessors = 1; // reached from the previous chain node
+            blocks.insert(*dummy);
+
+            cur->branch_false = dummy;
+            cur->cond = IR::Condition::Scc0;
+            dummy->branch_true = target;
+            target->num_predecessors++;
+            cur = dummy;
+        }
+        // Make the final dispatch unconditional.
+        cur->cond = IR::Condition::True;
+        cur->branch_false = nullptr;
+        LOG_WARNING(Render_Recompiler,
+                    "Lowered S_SETPC_B64 jump table at PC {:#x}: {} cases, selector sgpr{} "
+                    "(scale {:#x})",
+                    blk->begin, sw->targets.size(), sw->sel_sgpr, sw->scale);
+    }
+}
+
 static constexpr size_t LabelReserveSize = 32;
 
-CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_)
-    : block_pool{block_pool_}, inst_list{inst_list_} {
+CFG::CFG(Common::ObjectPool<Block>& block_pool_, std::span<const GcnInst> inst_list_,
+         std::span<const u32> code_, std::span<const u32> data_tail_)
+    : block_pool{block_pool_}, inst_list{inst_list_}, code{code_}, data_tail{data_tail_} {
     index_to_pc.resize(inst_list.size() + 1);
     labels.reserve(LabelReserveSize);
     EmitLabels();
     EmitBlocks();
     LinkBlocks();
     SplitDivergenceScopes();
+    // Lower jump-table switches before unreachable-block removal so all case
+    // blocks are properly linked as predecessors and survive.
+    LowerSwitches();
     RemoveUnreachableBlocks();
 }
 
@@ -127,12 +335,25 @@ void CFG::EmitLabels() {
             if (inst.opcode == Opcode::S_SETPC_B64) {
                 if (auto t = ResolveSetPcTarget(inst_list, i, index_to_pc)) {
                     target = *t;
+                } else if (auto sw = ResolveSetPcJumpTableFull(i)) {
+                    // Jump table: label every case target so blocks exist for
+                    // all of them; LowerSwitches builds the dispatch chain.
+                    LOG_WARNING(Render_Recompiler,
+                                "S_SETPC_B64 jump table at PC {:#x}: {} cases", pc,
+                                sw->targets.size());
+                    for (u32 t : sw->targets) {
+                        AddLabel(t);
+                    }
+                    target = sw->targets[0];
                 } else {
-                    ASSERT_MSG(
-                        false,
-                        "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
-                        "instructions not recognized or invalid pattern",
-                        pc, i);
+                    // Compat: unresolvable S_SETPC_B64 — treat as block boundary.
+                    LOG_WARNING(Render_Recompiler,
+                                "S_SETPC_B64 unresolvable at PC {:#x} (Index {}): "
+                                "treating as block boundary",
+                                pc, i);
+                    AddLabel(pc + inst.length);
+                    pc += inst.length;
+                    continue;
                 }
             }
             AddLabel(target);
@@ -334,11 +555,24 @@ void CFG::LinkBlocks() {
         u32 target_pc = 0;
         if (end_inst.opcode == Opcode::S_SETPC_B64) {
             auto tgt = ResolveSetPcTarget(inst_list, block.end_index, index_to_pc);
-            ASSERT_MSG(tgt,
-                       "S_SETPC_B64 without a resolvable offset at PC {:#x} (Index {}): Involved "
-                       "instructions not recognized or invalid pattern",
-                       branch_pc, block.end_index);
-            target_pc = *tgt;
+            if (tgt) {
+                target_pc = *tgt;
+            } else if (auto table_tgt = ResolveSetPcJumpTable(block.end_index)) {
+                target_pc = *table_tgt;
+            } else {
+                // Compat: unresolvable S_SETPC_B64 (indirect branch through
+                // runtime data). End the shader path here — an Exit block is
+                // structurally valid for every downstream pass, unlike
+                // fallthrough edges into unreached code.
+                block.end_class = EndClass::Exit;
+                block.branch_true = nullptr;
+                block.branch_false = nullptr;
+                LOG_WARNING(Render_Recompiler,
+                            "S_SETPC_B64 without resolvable offset at PC {:#x} (Index {}): "
+                            "ending shader path",
+                            branch_pc, block.end_index);
+                continue;
+            }
         } else {
             target_pc = end_inst.BranchTarget(branch_pc);
         }

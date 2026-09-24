@@ -396,19 +396,47 @@ private:
                         ip, *pool.Create(Goto{}, always_cond, false_label, &root_stmt)));
                 } else {
                     const IR::Value value = block.ir_block->branch_cond;
-                    ASSERT(!value.IsEmpty());
+                    if (value.IsEmpty()) {
+                        // Compat: a block flagged conditional without a materialized
+                        // branch condition (e.g. a switch chain fallback). Dispatch
+                        // unconditionally to the true target instead of aborting.
+                        LOG_WARNING(Render_Recompiler,
+                                    "Block at {:#x} has no branch condition; dispatching "
+                                    "unconditionally",
+                                    block.begin);
+                        const Node true_label{local_labels.at(block.branch_true)};
+                        gotos.push_back(root.insert(
+                            ip, *pool.Create(Goto{}, always_cond, true_label, &root_stmt)));
+                        break;
+                    }
                     IR::Inst* cond_ref = value.Inst();
-                    const Node true_label{local_labels.at(block.branch_true)};
-                    const Node false_label{local_labels.at(block.branch_false)};
-                    Statement* const true_cond{
-                        pool.Create(Identity{}, cond_ref->Arg(0), block.cond, &root_stmt)};
-                    cond_ref->Invalidate();
-                    gotos.push_back(
-                        root.insert(ip, *pool.Create(Goto{}, true_cond, true_label, &root_stmt)));
-                    gotos.push_back(root.insert(
-                        ip, *pool.Create(Goto{}, always_cond, false_label, &root_stmt)));
+                    if (cond_ref->GetOpcode() == IR::Opcode::ConditionRef) {
+                        // Standard wrapper: take the wrapped condition and
+                        // retire the wrapper instruction.
+                        Statement* const true_cond{pool.Create(
+                            Identity{}, cond_ref->Arg(0), block.cond, &root_stmt)};
+                        cond_ref->Invalidate();
+                        const Node true_label{local_labels.at(block.branch_true)};
+                        const Node false_label{local_labels.at(block.branch_false)};
+                        gotos.push_back(root.insert(
+                            ip, *pool.Create(Goto{}, true_cond, true_label, &root_stmt)));
+                        gotos.push_back(root.insert(
+                            ip, *pool.Create(Goto{}, always_cond, false_label, &root_stmt)));
+                    } else {
+                        // Raw condition inst (e.g. switch dispatch comparison):
+                        // use it directly without invalidation.
+                        const Node true_label{local_labels.at(block.branch_true)};
+                        const Node false_label{local_labels.at(block.branch_false)};
+                        Statement* const true_cond{
+                            pool.Create(Identity{}, IR::Value{cond_ref}, block.cond,
+                                        &root_stmt)};
+                        gotos.push_back(root.insert(
+                            ip, *pool.Create(Goto{}, true_cond, true_label, &root_stmt)));
+                        gotos.push_back(root.insert(
+                            ip, *pool.Create(Goto{}, always_cond, false_label, &root_stmt)));
+                    }
+                    break;
                 }
-                break;
             }
             case EndClass::Exit:
                 root.insert(ip, *pool.Create(Return{}, &root_stmt));

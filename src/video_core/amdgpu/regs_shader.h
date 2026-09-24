@@ -5,6 +5,7 @@
 
 #include "common/assert.h"
 #include "common/types.h"
+#include "core/memory.h"
 #include "shader_recompiler/params.h"
 
 namespace AmdGpu {
@@ -231,10 +232,31 @@ static constexpr const BinaryInfo& SearchBinaryInfo(const u32* code) {
 static constexpr Shader::ShaderParams GetParams(const auto& sh) {
     const auto* code = sh.template Address<u32*>();
     const auto& bininfo = SearchBinaryInfo(code);
+    const u32 length_dw = bininfo.length / sizeof(u32);
+    // Some games (e.g. Dreams) place PC-relative jump tables and constant
+    // data past the declared binary length but within the same allocation.
+    // Expose following mapped memory as a data tail for the recompiler.
+    std::span<const u32> tail{};
+    {
+        constexpr u32 margin_bytes = 64_KB;
+        auto* memory = Core::Memory::Instance();
+        const VAddr base = reinterpret_cast<VAddr>(code) + u64(length_dw) * sizeof(u32);
+        if (memory != nullptr) {
+            constexpr u64 page = 16_KB;
+            u64 off = 0;
+            while (off + page <= margin_bytes && memory->IsValidMapping(base + off, page)) {
+                off += page;
+            }
+            if (off != 0) {
+                tail = std::span{code + length_dw, u32(off / sizeof(u32))};
+            }
+        }
+    }
     return {
         .user_data = sh.user_data,
-        .code = std::span{code, bininfo.length / sizeof(u32)},
+        .code = std::span{code, length_dw},
         .hash = bininfo.shader_hash,
+        .data_tail = tail,
     };
 }
 

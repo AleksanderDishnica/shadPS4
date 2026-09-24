@@ -17,6 +17,9 @@ struct ShaderParams {
     std::span<const u32, NumShaderUserData> user_data;
     std::span<const u32> code;
     u64 hash;
+    // Guest memory mapped directly after the shader binary. Some games
+    // (e.g. Dreams) keep PC-relative jump tables here.
+    std::span<const u32> data_tail{};
 
     VAddr Base() const noexcept {
         return reinterpret_cast<VAddr>(code.data());

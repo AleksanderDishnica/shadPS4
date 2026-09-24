@@ -404,6 +404,14 @@ U32U64 IREmitter::SharedAtomicCmpSwap(const U32& address, const U32U64& value,
     }
 }
 
+F32 IREmitter::SharedAtomicFMin(const U32& address, const F32& value, bool is_gds) {
+    return Inst<F32>(Opcode::SharedAtomicFMin32, Flags{is_gds}, address, value);
+}
+
+F32 IREmitter::SharedAtomicFMax(const U32& address, const F32& value, bool is_gds) {
+    return Inst<F32>(Opcode::SharedAtomicFMax32, Flags{is_gds}, address, value);
+}
+
 template <>
 U32 IREmitter::SharedAtomicInc(const U32& address, bool is_gds) {
     return Inst<U32>(Opcode::SharedAtomicInc32, Flags{is_gds}, address);

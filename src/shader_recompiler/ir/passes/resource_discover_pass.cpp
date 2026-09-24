@@ -254,7 +254,13 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        if (!IsSharpSource(source)) {
+            // Compat: unknown sharp source pattern — skip instead of aborting.
+            LOG_WARNING(Render_Recompiler,
+                        "Unrecognized sharp source opcode {} in bindless fetch",
+                        u32(source->GetOpcode()));
+            continue;
+        }
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);

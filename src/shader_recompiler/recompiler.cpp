@@ -45,6 +45,62 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
     }
     translator.EmitPrologue(program.blocks.front());
     ASSERT_MSG(!program.info.translation_failed, "Shader translation has failed");
+
+    // Emit the switch selector comparisons along the dispatch chains. The
+    // selector value is the SSA value last written to the selector SGPR
+    // inside the switch block's own IR.
+    for (auto& block : cfg) {
+        if (!block.is_switch || block.switch_sel_sgpr == 0xFFFFFFFF) {
+            continue;
+        }
+        // Find the selector SSA value (last write wins).
+        IR::Value sel{};
+        for (auto& inst : *block.ir_block) {
+            if (inst.GetOpcode() == IR::Opcode::SetScalarRegister) {
+                const auto& reg = inst.Arg(0);
+                if (reg.Type() == IR::Type::ScalarReg &&
+                    reg.ScalarReg() == IR::ScalarReg(block.switch_sel_sgpr)) {
+                    sel = inst.Arg(1);
+                }
+            }
+        }
+        if (sel.IsEmpty()) {
+            LOG_WARNING(Render_Recompiler,
+                        "Switch selector sgpr{} not found; falling back to unconditional "
+                        "dispatch chain",
+                        block.switch_sel_sgpr);
+            // Repair the chain: make every node unconditionally dispatch its
+            // own target so no node is left without a branch condition.
+            Gcn::Block* cur = &block;
+            while (cur != nullptr) {
+                Gcn::Block* next = cur->branch_false;
+                cur->cond = IR::Condition::True;
+                cur->branch_false = nullptr;
+                cur = next;
+            }
+            continue;
+        }
+        // Walk the dispatch chain: switch block + dummies. Each node compares
+        // the selector against its case value; the last node is unconditional.
+        // NOTE: the comparison is stored directly (no ConditionRef wrapper) —
+        // wrapper insts created before the optimization passes get mangled;
+        // BuildTree special-cases raw condition insts.
+        const u32 scale = block.switch_selector_scale;
+        u32 case_value = 0;
+        Gcn::Block* cur = &block;
+        while (cur != nullptr) {
+            Gcn::Block* next = cur->branch_false; // next dummy (null for last)
+            if (cur->cond == IR::Condition::True) {
+                break; // final unconditional dispatch
+            }
+            IR::IREmitter ir{*cur->ir_block, cur->ir_block->end()};
+            cur->ir_block->branch_cond = ir.IEqual(IR::U32{sel}, ir.Imm32(case_value));
+            cur->cond = IR::Condition::Scc0;
+            case_value += scale;
+            cur = next;
+        }
+    }
+
     for (auto& block : cfg) {
         auto* ir_block = block.ir_block;
         if (block.branch_true) {
@@ -60,7 +116,8 @@ void EmitControlFlowGraph(IR::Program& program, Pools& pools, Gcn::CFG& cfg,
 }
 
 IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Info& info,
-                             RuntimeInfo& runtime_info, const Profile& profile) {
+                             RuntimeInfo& runtime_info, const Profile& profile,
+                             const std::span<const u32>& data_tail) {
     // Ensure first instruction is expected.
     constexpr u32 token_mov_vcchi = 0xBEEB03FF;
     if (code[0] != token_mov_vcchi) {
@@ -82,7 +139,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
 
     // Create control flow graph
     Common::ObjectPool<Gcn::Block> gcn_block_pool{64};
-    Gcn::CFG cfg{gcn_block_pool, program.ins_list};
+    Gcn::CFG cfg{gcn_block_pool, program.ins_list, code, data_tail};
     EmitControlFlowGraph(program, pools, cfg, runtime_info, profile);
 
     // On NVIDIA GPUs HW interpolation of clip distance values seems broken, and we need to emulate

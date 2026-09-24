@@ -382,9 +382,12 @@ static IR::Inst* IsAppendBufferPattern(IR::Inst& vx) {
                use.user->GetOpcode() == IR::Opcode::ISub32;
     });
     if (it == vx.Uses().end()) {
-        ASSERT(vx.UseCount() == 1 &&
-               vx.Uses().back().user->GetOpcode() == IR::Opcode::SetVectorRegister);
-        return &vx;
+        // Compat: tolerate other use patterns (e.g. multiple consumers).
+        if (vx.UseCount() == 1 &&
+            vx.Uses().back().user->GetOpcode() == IR::Opcode::SetVectorRegister) {
+            return &vx;
+        }
+        return nullptr;
     }
     const auto [user, operand] = *it;
     IR::U1 exec{vx.Arg(1)};
@@ -444,6 +447,20 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
         return;
     }
 
+    // Fallback for DataAppend/DataConsume that don't match the append buffer
+    // pattern (e.g. from DS_ORDERED_COUNT). Convert directly to atomics.
+    if (inst.GetOpcode() == IR::Opcode::DataAppend) {
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicIAdd(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u), {}));
+        return;
+    }
+    if (inst.GetOpcode() == IR::Opcode::DataConsume) {
+        const IR::U32 counter =
+            IR::U32{ir.BufferAtomicISub(ir.Imm32(binding), inst.Arg(0), ir.Imm32(1u), {})};
+        inst.ReplaceUsesWith(ir.ISub(counter, ir.Imm32(1u)));
+        return;
+    }
+
     // Convert shared memory opcode to storage buffer atomic to GDS buffer.
     auto& buffer = info.buffers[binding];
     const IR::U32 offset = IR::U32{inst.Arg(0)};
@@ -461,6 +478,10 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     case IR::Opcode::SharedAtomicISub32:
         inst.ReplaceUsesWith(ir.BufferAtomicISub(handle, address_dwords, inst.Arg(1), {}));
         break;
+    case IR::Opcode::SharedAtomicISub64:
+        // No BufferAtomicISub64 opcode exists — leave as shared atomic (approximate).
+        LOG_WARNING(Render_Recompiler, "Unpatched GDS SharedAtomicISub64 (approximate)");
+        break;
     case IR::Opcode::SharedAtomicSMin32:
     case IR::Opcode::SharedAtomicUMin32: {
         const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin32;
@@ -475,6 +496,20 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
             ir.BufferAtomicIMax(handle, address_dwords, inst.Arg(1), is_signed, {}));
         break;
     }
+    case IR::Opcode::SharedAtomicSMin64:
+    case IR::Opcode::SharedAtomicUMin64: {
+        const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMin64;
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicIMin(handle, address_qwords, IR::U64{inst.Arg(1)}, is_signed, {}));
+        break;
+    }
+    case IR::Opcode::SharedAtomicSMax64:
+    case IR::Opcode::SharedAtomicUMax64: {
+        const bool is_signed = inst.GetOpcode() == IR::Opcode::SharedAtomicSMax64;
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicIMax(handle, address_qwords, IR::U64{inst.Arg(1)}, is_signed, {}));
+        break;
+    }
     case IR::Opcode::SharedAtomicInc32:
         inst.ReplaceUsesWith(ir.BufferAtomicInc(handle, address_dwords, {}));
         break;
@@ -484,11 +519,32 @@ void PatchGlobalDataShareAccess(IR::Inst& inst, Info& info, Descriptors& descrip
     case IR::Opcode::SharedAtomicAnd32:
         inst.ReplaceUsesWith(ir.BufferAtomicAnd(handle, address_dwords, inst.Arg(1), {}));
         break;
+    case IR::Opcode::SharedAtomicAnd64:
+        // No BufferAtomicAnd64 opcode exists — leave as shared atomic (approximate).
+        LOG_WARNING(Render_Recompiler, "Unpatched GDS SharedAtomicAnd64 (approximate)");
+        break;
+    case IR::Opcode::SharedAtomicFMin32:
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicFMin(handle, address_dwords, IR::F32{inst.Arg(1)}, {}));
+        break;
+    case IR::Opcode::SharedAtomicFMax32:
+        inst.ReplaceUsesWith(
+            ir.BufferAtomicFMax(handle, address_dwords, IR::F32{inst.Arg(1)}, {}));
+        break;
     case IR::Opcode::SharedAtomicOr32:
         inst.ReplaceUsesWith(ir.BufferAtomicOr(handle, address_dwords, inst.Arg(1), {}));
         break;
     case IR::Opcode::SharedAtomicXor32:
         inst.ReplaceUsesWith(ir.BufferAtomicXor(handle, address_dwords, inst.Arg(1), {}));
+        break;
+    case IR::Opcode::SharedAtomicOr64:
+    case IR::Opcode::SharedAtomicXor64:
+    case IR::Opcode::SharedAtomicInc64:
+    case IR::Opcode::SharedAtomicDec64:
+    case IR::Opcode::SharedAtomicCmpSwap64:
+        // No 64-bit buffer equivalents — leave as shared atomics (approximate).
+        LOG_WARNING(Render_Recompiler, "Unpatched GDS opcode {} (approximate)",
+                    u32(inst.GetOpcode()));
         break;
     case IR::Opcode::SharedAtomicCmpSwap32:
         // Args are (address, value, cmp_value)

@@ -223,6 +223,16 @@ Id EmitSharedAtomicCmpSwap32(EmitContext& ctx, Id offset, Id value, Id cmp_value
     return SharedAtomicU32CmpSwap(ctx, offset, value, cmp_value);
 }
 
+Id EmitSharedAtomicFMin32(EmitContext& ctx, Id offset, Id value) {
+    UNREACHABLE_MSG("SPIR-V pseudo-instruction: SharedAtomicFMin32 is replaced by the "
+                    "resource patching pass before codegen");
+}
+
+Id EmitSharedAtomicFMax32(EmitContext& ctx, Id offset, Id value) {
+    UNREACHABLE_MSG("SPIR-V pseudo-instruction: SharedAtomicFMax32 is replaced by the "
+                    "resource patching pass before codegen");
+}
+
 Id EmitSharedAtomicCmpSwap64(EmitContext& ctx, Id offset, Id value, Id cmp_value) {
     return SharedAtomicU64CmpSwap(ctx, offset, value, cmp_value);
 }

@@ -76,6 +76,14 @@ void Translator::EmitDataShare(const GcnInst& inst) {
         return DS_CONSUME(inst);
     case Opcode::DS_APPEND:
         return DS_APPEND(inst);
+    case Opcode::DS_ORDERED_COUNT:
+        return DS_ORDERED_COUNT(inst);
+    case Opcode::DS_MIN_F32:
+        return DS_MIN_F32(inst);
+    case Opcode::DS_MAX_F32:
+        return DS_MAX_F32(inst);
+    case Opcode::DS_MAX_U64:
+        return DS_MAX_U64(inst);
     case Opcode::DS_WRITE_B16:
         return DS_WRITE(16, false, false, false, inst);
     case Opcode::DS_WRITE_B64:
@@ -348,6 +356,46 @@ void Translator::DS_CONSUME(const GcnInst& inst) {
     const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
     const IR::U32 prev = ir.DataConsume(ir.ShiftRightLogical(gds_offset, ir.Imm32(2u)));
     SetDst(inst.dst[0], prev);
+}
+
+void Translator::DS_ORDERED_COUNT(const GcnInst& inst) {
+    // Ordered count: atomically increment a GDS counter and return the old value.
+    // On real GCN hardware only one lane per wave performs the increment and the
+    // result is broadcast. We implement it as a standard atomic add (DataAppend)
+    // which the resource patching pass converts to a buffer atomic operation.
+    const u32 inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
+    const IR::U32 prev = ir.DataAppend(ir.ShiftRightLogical(gds_offset, ir.Imm32(2u)));
+    SetDst(inst.dst[0], prev);
+}
+
+void Translator::DS_MIN_F32(const GcnInst& inst) {
+    const u32 inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
+    const IR::F32 value = GetSrc<IR::F32>(inst.src[0]);
+    const IR::F32 prev = ir.SharedAtomicFMin(ir.ShiftRightLogical(gds_offset, ir.Imm32(2u)),
+                                              value, true);
+    SetDst(inst.dst[0], prev);
+}
+
+void Translator::DS_MAX_F32(const GcnInst& inst) {
+    const u32 inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const IR::U32 gds_offset = ir.IAdd(base, ir.Imm32(inst_offset));
+    const IR::F32 value = GetSrc<IR::F32>(inst.src[0]);
+    const IR::F32 prev = ir.SharedAtomicFMax(ir.ShiftRightLogical(gds_offset, ir.Imm32(2u)),
+                                              value, true);
+    SetDst(inst.dst[0], prev);
+}
+
+void Translator::DS_MAX_U64(const GcnInst& inst) {
+    const auto inst_offset = (u32(inst.control.ds.offset1) << 8u) + inst.control.ds.offset0;
+    const auto base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    const auto addr = ir.IAdd(base, ir.Imm32(inst_offset));
+    const auto value = GetSrc64(inst.src[0]);
+    SetDst(inst.dst[0], ir.SharedAtomicIMax(addr, value, false, true));
 }
 
 } // namespace Shader::Gcn
