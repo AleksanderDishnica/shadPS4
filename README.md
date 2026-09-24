@@ -1,4 +1,4 @@
-This is a Shadps4 patch for Medievil Remake v1.00.
+***This is a Shadps4 patch for Medievil Remake v1.00.***
 I have modified other things too.
 I made use of AI to make this happen and I am not connected nor know any of the shadPS4 devs.
 This is not a patch that should be sent to shadPS4 devs.
