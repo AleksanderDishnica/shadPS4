@@ -69,6 +69,28 @@ Linker::Linker() : memory{Memory::Instance()} {}
 Linker::~Linker() = default;
 
 void Linker::Execute(const std::vector<std::string>& args) {
+    // Compat diagnostics: dump module export symbols for offline
+    // symbolication of crash addresses. Disabled unless the
+    // SHADPS4_DUMP_SYMBOLS environment variable is set (its value is the
+    // output path; "1" = eboot_symbols.txt next to the executable).
+    try {
+        char env[512]{};
+        size_t env_len = 0;
+        if (getenv_s(&env_len, env, sizeof(env) - 1, "SHADPS4_DUMP_SYMBOLS") == 0 &&
+            env_len > 0) {
+            const std::string path = strcmp(env, "1") == 0 ? "eboot_symbols.txt" : env;
+            std::ofstream out(path);
+            for (const auto& m : m_modules) {
+                Module* module = m.get();
+                out << "MODULE " << module->file.stem().string() << " base="
+                    << fmt::format("{:#x}", module->GetBaseAddress()) << "\n";
+                for (const auto& sym : module->export_sym.GetSymbols()) {
+                    out << fmt::format("{:#018x} {}\n", sym.virtual_address, sym.name);
+                }
+            }
+        }
+    } catch (...) {
+    }
     if (EmulatorSettings.IsDebugDump()) {
         DebugDump();
     }

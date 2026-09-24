@@ -28,20 +28,50 @@ static CaptureState capture_state{CaptureState::Idle};
 static std::atomic<u32> screenshot_game_only_count{0};
 static std::atomic<u32> screenshot_with_overlays_count{0};
 
+static void* capture_device{};
+static void* capture_window{};
+
+void SetCaptureTarget(void* device, void* window) {
+    capture_device = device;
+    capture_window = window;
+    LOG_WARNING(Common, "RenderDoc capture target: device={:p} window={:p}", device, window);
+}
+
 RENDERDOC_API_1_6_0* rdoc_api{};
 
 void LoadRenderDoc() {
-#ifdef WIN32
+#ifdef _WIN32
 
     // Check if we are running by RDoc GUI
     HMODULE mod = GetModuleHandleA("renderdoc.dll");
     if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
-        // If enabled in config, try to load RDoc runtime in offline mode
+        // If enabled in config, try to load RDoc runtime in offline mode.
+        // The Vulkan capture layer (activated via VK_INSTANCE_LAYERS /
+        // VK_LAYER_PATH) is the authoritative instance: load the same DLL so
+        // the capture API connects to it.
+        char layer_path[MAX_PATH]{};
+        size_t layer_len = 0;
+        if (getenv_s(&layer_len, layer_path, sizeof(layer_path) - MAX_PATH / 2,
+                     "VK_LAYER_PATH") == 0 &&
+            layer_len > 0) {
+            std::string lib = std::string(layer_path) + "\\renderdoc.dll";
+            mod = LoadLibraryA(lib.c_str());
+        }
+        if (mod == nullptr) {
+            mod = LoadLibraryA("renderdoc.dll");
+        }
+        if (mod == nullptr) {
+            LOG_WARNING(Render, "Direct renderdoc.dll load failed (err={}); trying registry",
+                        GetLastError());
+        }
+    }
+    if (!mod && EmulatorSettings.IsRenderdocEnabled()) {
         HKEY h_reg_key;
         LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                                     L"SOFTWARE\\Classes\\RenderDoc.RDCCapture.1\\DefaultIcon\\", 0,
                                     KEY_READ, &h_reg_key);
         if (result != ERROR_SUCCESS) {
+            LOG_WARNING(Render, "RenderDoc enabled but runtime not found");
             return;
         }
         std::array<wchar_t, MAX_PATH> key_str{};
@@ -84,12 +114,15 @@ void LoadRenderDoc() {
     }
 #endif
     if (rdoc_api) {
-        // Disable default capture keys as they suppose to trigger present-to-present capturing
-        // and it is not what we want
-        rdoc_api->SetCaptureKeys(nullptr, 0);
+        LOG_INFO(Render, "RenderDoc API loaded (offline capture available)");
+        // Keep RenderDoc's default capture hotkey (F12) enabled so captures
+        // can be triggered externally; it captures at the next present and
+        // writes the file itself.
 
         // Also remove rdoc crash handler
         rdoc_api->UnloadCrashHandler();
+    } else if (EmulatorSettings.IsRenderdocEnabled()) {
+        LOG_WARNING(Render, "RenderDoc enabled but API not loaded (renderdoc.dll not found)");
     }
 }
 
@@ -99,7 +132,7 @@ void StartCapture() {
     }
 
     if (capture_state == CaptureState::Triggered) {
-        rdoc_api->StartFrameCapture(nullptr, nullptr);
+        rdoc_api->StartFrameCapture(capture_device, capture_window);
         capture_state = CaptureState::InProgress;
     }
 }
@@ -110,7 +143,7 @@ void EndCapture() {
     }
 
     if (capture_state == CaptureState::InProgress) {
-        rdoc_api->EndFrameCapture(nullptr, nullptr);
+        rdoc_api->EndFrameCapture(capture_device, capture_window);
         capture_state = CaptureState::Idle;
     }
 }
@@ -131,6 +164,10 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix) 
 
 bool IsRenderDocLoaded() {
     return rdoc_api != nullptr;
+}
+
+RENDERDOC_API_1_6_0* GetRenderDocAPI() {
+    return rdoc_api;
 }
 
 void RequestScreenshot(const ScreenshotRequest request) {

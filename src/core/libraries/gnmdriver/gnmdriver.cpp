@@ -22,6 +22,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
 extern Frontend::WindowSDL* g_window;
@@ -2258,7 +2259,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffers(u32 count, u32* dcb_gpu_addrs
 s32 PS4_SYSV_ABI sceGnmSubmitAndFlipCommandBuffersForWorkload(
     u32 workload, u32 count, u32* dcb_gpu_addrs[], u32* dcb_sizes_in_bytes, u32* ccb_gpu_addrs[],
     u32* ccb_sizes_in_bytes, u32 vo_handle, u32 buf_idx, u32 flip_mode, s64 flip_arg) {
-    LOG_DEBUG(Lib_GnmDriver, "called [buf = {}]", buf_idx);
+    LOG_DEBUG(Lib_GnmDriver, "SubmitAndFlip: buf_idx={} vo_handle={}", buf_idx, vo_handle);
 
     if (count != 0) {
         if (!dcb_gpu_addrs) {
@@ -2314,6 +2315,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
                                                        const u32* ccb_gpu_addrs[],
                                                        u32* ccb_sizes_in_bytes) {
     HLE_TRACE;
+    LOG_WARNING(Lib_GnmDriver, "SubmitCommandBuffers: count={}", count);
     LOG_DEBUG(Lib_GnmDriver, "called");
 
     if (!dcb_gpu_addrs || !dcb_sizes_in_bytes) {
@@ -2354,7 +2356,7 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffers(u32 count, const u32* dcb_gpu_addrs[
 
 s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     HLE_TRACE;
-    LOG_DEBUG(Lib_GnmDriver, "called");
+    LOG_DEBUG(Lib_GnmDriver, "SubmitDone: frames={}", frames_submitted);
     std::scoped_lock lk{m_submit_lock};
     WaitGpuIdle();
     if (!liverpool->IsGpuIdle()) {
@@ -2365,6 +2367,48 @@ s32 PS4_SYSV_ABI sceGnmSubmitDone() {
     send_init_packet = true;
     ++frames_submitted;
     DebugState.IncGnmFrameNum();
+    // Auto frame capture: RDOC_AUTO_CAPTURE_FRAME=a,b,c in the environment
+    // triggers RenderDoc captures at those frames (diagnostics for menu
+    // rendering).
+    {
+        static const std::vector<s64> auto_frames = [] {
+            std::vector<s64> out;
+            char buf[256]{};
+            size_t len = 0;
+            if (getenv_s(&len, buf, sizeof(buf) - 1, "RDOC_AUTO_CAPTURE_FRAME") == 0 &&
+                len > 0) {
+                std::string s{buf};
+                size_t pos = 0;
+                while (pos < s.size()) {
+                    size_t comma = s.find(',', pos);
+                    if (comma == std::string::npos) {
+                        comma = s.size();
+                    }
+                    const std::string part = s.substr(pos, comma - pos);
+                    if (!part.empty()) {
+                        out.push_back(atoll(part.c_str()));
+                    }
+                    pos = comma + 1;
+                }
+            }
+            return out;
+        }();
+        for (const s64 auto_frame : auto_frames) {
+            if (s64(frames_submitted) == auto_frame) {
+                LOG_WARNING(Lib_GnmDriver, "Auto RenderDoc capture triggered at frame {}",
+                            frames_submitted);
+                VideoCore::TriggerCapture();
+                VideoCore::StartCapture();
+            } else if (s64(frames_submitted) == auto_frame + 2) {
+                LOG_WARNING(Lib_GnmDriver, "Auto RenderDoc capture ending at frame {}",
+                            frames_submitted);
+                VideoCore::EndCapture();
+            }
+        }
+        if (frames_submitted % 250 == 0) {
+            LOG_DEBUG(Lib_GnmDriver, "Frame counter: {}", frames_submitted);
+        }
+    }
     return ORBIS_OK;
 }
 

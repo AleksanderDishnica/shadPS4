@@ -8,6 +8,7 @@
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
 
@@ -25,6 +26,11 @@ Swapchain::Swapchain(const Instance& instance_, const Frontend::WindowSDL& windo
 
     Create(window.GetWidth(), window.GetHeight());
     ImGui::Core::Initialize(instance, window, image_count, surface_format.format);
+    // Register the capture target so RenderDoc frame captures find the device
+    // capturer. Passing a NULL window makes RenderDoc use its device-frame-
+    // capturer fallback (first registered), which is reliable.
+    VideoCore::SetCaptureTarget(
+        reinterpret_cast<void*>(static_cast<VkInstance>(instance.GetInstance())), nullptr);
 }
 
 Swapchain::~Swapchain() {

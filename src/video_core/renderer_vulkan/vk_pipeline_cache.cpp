@@ -1,5 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include "video_core/seh_guard.h"
+#include <stdexcept>
 
 #include <ranges>
 
@@ -614,12 +616,14 @@ bool PipelineCache::RefreshComputeKey() {
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding,
+                                              const std::span<const u32>& data_tail) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
-    const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    const auto ir_program =
+        Shader::TranslateProgram(code, pools, info, runtime_info, profile, data_tail);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
@@ -654,7 +658,27 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        // Compile under an SEH guard: if heap corruption crashes the compiler,
+        // surface it as an exception so the GPU submit batch is dropped
+        // instead of the process dying.
+        struct CompileCtx {
+            PipelineCache* self;
+            Shader::Info* info;
+            Shader::RuntimeInfo* runtime_info;
+            std::span<const u32> code;
+            std::span<const u32> data_tail;
+            Shader::Backend::Bindings* binding;
+            vk::ShaderModule result;
+        } ctx{this, &program->info, &runtime_info, params.code, params.data_tail, &binding};
+        const auto thunk = [](void* p) {
+            auto* c = static_cast<CompileCtx*>(p);
+            c->result = c->self->CompileModule(*c->info, *c->runtime_info, c->code, 0,
+                                               *c->binding, c->data_tail);
+        };
+        if (!SehGuardRun(thunk, &ctx)) {
+            throw std::runtime_error("shader compile crashed (guarded)");
+        }
+        const auto module = ctx.result;
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
@@ -679,7 +703,7 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding, params.data_tail);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

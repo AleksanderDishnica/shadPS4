@@ -111,7 +111,8 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding,
+                                   const std::span<const u32>& data_tail = {});
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {

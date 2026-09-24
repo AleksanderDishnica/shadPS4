@@ -6,11 +6,16 @@
 #include <filesystem>
 #include <string>
 #include "common/types.h"
+#include "renderdoc_app.h"
 
 namespace VideoCore {
 
 /// Loads renderdoc dynamic library module.
 void LoadRenderDoc();
+
+/// Sets the (device, window) pair used to target frame captures. RenderDoc's
+/// default NULL lookup can miss the capturer with unusual device topologies.
+void SetCaptureTarget(void* device, void* window);
 
 /// Begins a capture if a renderdoc instance is attached.
 void StartCapture();
@@ -26,6 +31,9 @@ void SetOutputDir(const std::filesystem::path& path, const std::string& prefix);
 
 /// Returns true when RenderDoc API was loaded and is usable.
 bool IsRenderDocLoaded();
+
+/// Returns the raw RenderDoc API when loaded, or null.
+RENDERDOC_API_1_6_0* GetRenderDocAPI();
 
 enum class ScreenshotRequest : u32 {
     None = 0,
