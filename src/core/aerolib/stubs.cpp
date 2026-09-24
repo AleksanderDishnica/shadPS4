@@ -15,7 +15,11 @@ namespace Core::AeroLib {
 // If it runs out of stubs with name information, it will return
 // a default implementation without function name details
 
-constexpr u32 MAX_STUBS = 8192;
+constexpr u32 MAX_STUBS = 16384;
+
+// Some games (e.g., MediEvil via UE4 OnlineSubsystemPS4) dereference pointers returned by
+// stubbed functions. Point them at zeroed memory instead of null to survive.
+static u8 DummyResponse[0x4000]{};
 
 u64 UnresolvedStub() {
     LOG_ERROR(Core, "Returning zero to {}", __builtin_return_address(0));
@@ -35,6 +39,13 @@ static u64 CommonStub(int stub_index, void* addr) {
     if (entry) {
         LOG_ERROR(Core, "Stub: {} (nid: {}) called, returning zero to {}", entry->name, entry->nid,
                   addr);
+        // MediEvil's UE4 OnlineSubsystemPS4 dereferences pointers returned by Toolkit2NP
+        // Response<T>::get() accessors. Hand those zeroed memory instead of null. Scoped
+        // to Toolkit2NP symbols so other titles keep the stock zero-return behavior.
+        const std::string_view stub_name{entry->name};
+        if (stub_name.contains("Toolkit2NP") && stub_name.ends_with("3getEv")) {
+            return (u64)DummyResponse;
+        }
     } else {
         LOG_ERROR(Core, "Stub: Unknown (nid: {}) called, returning zero to {}",
                   stub_nids_unknown[stub_index], addr);

@@ -10,21 +10,43 @@
 namespace Libraries::LibcInternal {
 
 s32 PS4_SYSV_ABI internal_strcpy_s(char* dest, size_t dest_size, const char* src) {
-#ifdef _WIN64
-    return strcpy_s(dest, dest_size, src);
-#else
-    std::strcpy(dest, src);
-    return 0; // ALL OK
-#endif
+    // PS4 libc semantics: return an error code on failure instead of
+    // terminating the process (MSVC's strcpy_s invokes the invalid parameter
+    // handler which fastfails).
+    if (dest == nullptr || dest_size == 0) {
+        return 22; // EINVAL
+    }
+    if (src == nullptr) {
+        dest[0] = '\0';
+        return 22; // EINVAL
+    }
+    const size_t len = std::strlen(src);
+    if (len + 1 > dest_size) {
+        std::memcpy(dest, src, dest_size - 1);
+        dest[dest_size - 1] = '\0';
+        return 34; // ERANGE
+    }
+    std::memcpy(dest, src, len + 1);
+    return 0;
 }
 
 s32 PS4_SYSV_ABI internal_strcat_s(char* dest, size_t dest_size, const char* src) {
-#ifdef _WIN64
-    return strcat_s(dest, dest_size, src);
-#else
-    std::strcat(dest, src);
-    return 0; // ALL OK
-#endif
+    if (dest == nullptr || dest_size == 0) {
+        return 22; // EINVAL
+    }
+    if (src == nullptr) {
+        return 22; // EINVAL
+    }
+    const size_t dlen = strnlen(dest, dest_size);
+    if (dlen == dest_size) {
+        return 22; // EINVAL — dest not null-terminated
+    }
+    const size_t slen = std::strlen(src);
+    if (dlen + slen + 1 > dest_size) {
+        return 34; // ERANGE
+    }
+    std::memcpy(dest + dlen, src, slen + 1);
+    return 0;
 }
 
 s32 PS4_SYSV_ABI internal_strcmp(const char* str1, const char* str2) {
@@ -44,12 +66,27 @@ char* PS4_SYSV_ABI internal_strncpy(char* dest, const char* src, std::size_t cou
 }
 
 s32 PS4_SYSV_ABI internal_strncpy_s(char* dest, size_t destsz, const char* src, size_t count) {
-#ifdef _WIN64
-    return strncpy_s(dest, destsz, src, count);
-#else
-    std::strcpy(dest, src);
+    // PS4 libc semantics: return an error code on failure instead of
+    // terminating the process (MSVC's strncpy_s invokes the invalid parameter
+    // handler which fastfails).
+    if (dest == nullptr || destsz == 0) {
+        return 22; // EINVAL
+    }
+    if (src == nullptr) {
+        dest[0] = '\0';
+        return 22; // EINVAL
+    }
+    const size_t len = strnlen(src, count);
+    if (len >= destsz) {
+        // Truncate and report range error, like the PS4 implementation.
+        std::memcpy(dest, src, destsz - 1);
+        dest[destsz - 1] = '\0';
+        return 34; // ERANGE
+    }
+    std::memcpy(dest, src, len);
+    // strncpy pads the remainder with zeros up to count — replicate.
+    std::memset(dest + len, 0, count - len);
     return 0;
-#endif
 }
 
 char* PS4_SYSV_ABI internal_strcat(char* dest, const char* src) {

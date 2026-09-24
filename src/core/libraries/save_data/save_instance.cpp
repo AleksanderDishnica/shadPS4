@@ -194,7 +194,9 @@ void SaveInstance::SetupAndMount(bool read_only, bool copy_icon, bool ignore_cor
 
 void SaveInstance::Umount() {
     if (!mounted) {
-        UNREACHABLE_MSG("Save instance is not mounted");
+        // Games may double-umount (e.g. after a failed mount or an explicit
+        // close followed by an automatic one). Tolerate it like the PS4 does.
+        LOG_WARNING(Lib_SaveData, "Save instance umount called while not mounted");
         return;
     }
     mounted = false;

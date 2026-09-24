@@ -86,7 +86,10 @@ void AjmContext::ProcessBatch(u32 id, std::span<AjmJob> jobs) {
             {
                 std::shared_lock lock(instances_mutex);
                 auto* p_instance = instances.Get(job.instance_id & INSTANCE_ID_MASK);
-                ASSERT_MSG(p_instance != nullptr, "Attempting to execute job on null instance");
+                if (p_instance == nullptr) {
+                    LOG_WARNING(Lib_Ajm, "Skipping job for destroyed instance {}", job.instance_id);
+                    continue;
+                }
                 instance = *p_instance;
             }
 

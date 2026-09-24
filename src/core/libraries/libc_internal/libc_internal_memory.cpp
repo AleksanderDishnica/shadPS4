@@ -18,12 +18,17 @@ void* PS4_SYSV_ABI internal_memcpy(void* dest, const void* src, size_t n) {
 }
 
 s32 PS4_SYSV_ABI internal_memcpy_s(void* dest, size_t destsz, const void* src, size_t count) {
-#ifdef _WIN64
-    return memcpy_s(dest, destsz, src, count);
-#else
+    // PS4 libc semantics: return an error code on failure instead of
+    // terminating the process (MSVC's memcpy_s invokes the invalid parameter
+    // handler which fastfails).
+    if (dest == nullptr) {
+        return 22; // EINVAL
+    }
+    if (src == nullptr || count > destsz) {
+        return 22; // EINVAL
+    }
     std::memcpy(dest, src, count);
-    return 0; // ALL OK
-#endif
+    return 0;
 }
 
 s32 PS4_SYSV_ABI internal_memcmp(const void* s1, const void* s2, size_t n) {

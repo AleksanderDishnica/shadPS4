@@ -142,6 +142,17 @@ s32 loadModuleInternal(s32 index, s32 argc, const void* argv, s32* res_out) {
         // If the module is missing, the library prints a very helpful message for developers.
         // We'll just log an error.
         if (result < 0) {
+            if (std::string_view{mod.name} == "libSceNpToolkit2") {
+                // MediEvil treats NP toolkit load failure as fatal. Report success with a
+                // dummy handle so it can continue offline. Scoped to this module only to
+                // keep stock behavior for every other title.
+                LOG_ERROR(Lib_SysModule,
+                          "Failed to load game library {} - continuing with dummy handle",
+                          guest_path);
+                mod.handle = 0;
+                mod.is_loaded++;
+                return ORBIS_OK;
+            }
             LOG_ERROR(Lib_SysModule, "Failed to load game library {}", guest_path);
             return result;
         } else {
