@@ -1,3 +1,10 @@
+This is a Shadps4 patch for Medievil Remake v1.00.
+I have modified other things too.
+I made use of AI to make this happen and I am not connected nor know any of the shadPS4 devs.
+This is not a patch that should be sent to shadPS4 devs.
+While they allow the use of AI, there are specific rules they ask for, in order for them to add it into their own emulator.
+For this reason, I did not push request to their repository.
+
 <!--
 SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
 SPDX-License-Identifier: GPL-2.0-or-later
